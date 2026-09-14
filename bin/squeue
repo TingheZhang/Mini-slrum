@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+import sys
+import os
+import argparse
+import time
+import json
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(BASE_DIR, "lib"))
+
+from mslurm_db import MiniSlurmDB
+
+def format_time(seconds):
+    if not seconds or seconds < 0:
+        return "00:00"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+def main():
+    parser = argparse.ArgumentParser(description="Mini-Slurm squeue")
+    parser.add_argument("--json", action="store_true", help="Output JSON format")
+    parser.add_argument("--all", "-a", action="store_true", help="Show all recent jobs including finished")
+    args = parser.parse_args()
+
+    db_path = os.path.join(BASE_DIR, "var", "mslurm.db")
+    db = MiniSlurmDB(db_path)
+
+    jobs = db.list_jobs(active_only=(not args.all), limit=100)
+    now = time.time()
+
+    if args.json:
+        print(json.dumps(jobs, indent=2))
+        return
+
+    # Print table header
+    header = f"{'JOBID':<8} {'NAME':<16} {'USER':<10} {'ST':<10} {'TIME':<10} {'NODELIST(RESOURCES)':<24}"
+    print(header)
+
+    for j in jobs:
+        jid = str(j["job_id"])
+        name = (j["name"][:14] + "..") if len(j["name"]) > 16 else j["name"]
+        user = j["user"][:9]
+        st = j["status"]
+
+        if st == "RUNNING" and j["start_time"]:
+            elapsed = format_time(now - j["start_time"])
+        elif st in ("COMPLETED", "FAILED", "TIMEOUT", "CANCELLED") and j["start_time"] and j["end_time"]:
+            elapsed = format_time(j["end_time"] - j["start_time"])
+        else:
+            elapsed = "00:00"
+
+        if st == "RUNNING":
+            node = j["allocated_node"] or ""
+            gpus = j["allocated_gpus"]
+            res = f"{node}:gpu[{gpus}]" if gpus else f"{node}:cpu[{j['allocated_cpus']}]"
+        elif st == "STARTING":
+            res = f"{j['allocated_node']} (Launching)"
+        elif st == "PENDING":
+            res = "(Resources)"
+        else:
+            res = f"({st})"
+
+        print(f"{jid:<8} {name:<16} {user:<10} {st:<10} {elapsed:<10} {res:<24}")
+
+if __name__ == "__main__":
+    main()

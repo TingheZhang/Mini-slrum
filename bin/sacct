@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+import sys
+import os
+import argparse
+import time
+import json
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(BASE_DIR, "lib"))
+
+from mslurm_db import MiniSlurmDB
+
+def format_time(seconds):
+    if not seconds or seconds < 0:
+        return "00:00"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+def format_timestamp(ts):
+    if not ts:
+        return "Unknown"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+def main():
+    parser = argparse.ArgumentParser(description="Mini-Slurm sacct")
+    parser.add_argument("-j", "--jobs", help="Job ID to query")
+    parser.add_argument("--json", action="store_true", help="Output JSON format")
+    parser.add_argument("-n", "--limit", type=int, default=20, help="Number of records to show")
+    args = parser.parse_args()
+
+    db_path = os.path.join(BASE_DIR, "var", "mslurm.db")
+    db = MiniSlurmDB(db_path)
+
+    if args.jobs:
+        job = db.get_job(int(args.jobs))
+        jobs = [job] if job else []
+    else:
+        jobs = db.list_jobs(active_only=False, limit=args.limit)
+
+    if args.json:
+        print(json.dumps(jobs, indent=2))
+        return
+
+    header = f"{'JobID':<8} {'JobName':<16} {'Node':<10} {'State':<12} {'ExitCode':<10} {'Elapsed':<10} {'SubmitTime':<20}"
+    print(header)
+
+    for j in jobs:
+        jid = str(j["job_id"])
+        name = (j["name"][:14] + "..") if len(j["name"]) > 16 else j["name"]
+        node = j["allocated_node"] or "-"
+        st = j["status"]
+        code = str(j["exit_code"]) if j["exit_code"] is not None else "-"
+        
+        if j["start_time"] and j["end_time"]:
+            elapsed = format_time(j["end_time"] - j["start_time"])
+        elif j["start_time"]:
+            elapsed = format_time(time.time() - j["start_time"])
+        else:
+            elapsed = "00:00"
+
+        sub_time = format_timestamp(j["submit_time"])
+        print(f"{jid:<8} {name:<16} {node:<10} {st:<12} {code:<10} {elapsed:<10} {sub_time:<20}")
+
+if __name__ == "__main__":
+    main()

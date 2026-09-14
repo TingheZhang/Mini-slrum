@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+import sys
+import os
+from os import environ
+import time
+import json
+import signal
+import subprocess
+import logging
+import shlex
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(BASE_DIR, "lib"))
+
+from mslurm_db import MiniSlurmDB
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+running = True
+def handle_exit(signum, frame):
+    global running
+    logging.info("Received signal to terminate. Stopping scheduler...")
+    running = False
+
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
+
+def load_nodes_config(conf_path):
+    if not os.path.exists(conf_path):
+        return {}
+    try:
+        with open(conf_path, "r") as f:
+            data = json.load(f)
+        return data.get("nodes", {})
+    except Exception as e:
+        logging.error(f"Failed to load {conf_path}: {e}")
+        return {}
+
+REMOTE_PROBE_SCRIPT = '''import os, sys
+target_jid = str(sys.argv[1])
+target_sid = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] != 'None' else None
+my_pid = os.getpid()
+ppid = os.getppid()
+found = False
+for p in os.listdir('/proc'):
+    if not p.isdigit() or int(p) in (my_pid, ppid):
+        continue
+    pid = int(p)
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            args = [a.decode('utf-8', 'ignore') for a in f.read().split(b'\\x00') if a]
+        has_exec = any('mslurm-executor' in a for a in args)
+        has_jid = False
+        for i, a in enumerate(args):
+            if (a == '--job-id' and i + 1 < len(args) and args[i+1] == target_jid) or a == f'--job-id={target_jid}':
+                has_jid = True
+                break
+        if has_exec and has_jid:
+            found = True
+            break
+        if target_sid is not None and not found:
+            try:
+                if os.getsid(pid) == target_sid:
+                    found = True
+                    break
+            except Exception:
+                pass
+    except Exception:
+        continue
+sys.exit(0 if found else 1)
+'''
+
+REMOTE_KILL_SCRIPT = '''import os, sys, signal
+target_jid = str(sys.argv[1])
+target_sid = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] != 'None' else None
+my_pid = os.getpid()
+ppid = os.getppid()
+pids = set()
+for p in os.listdir('/proc'):
+    if not p.isdigit() or int(p) in (my_pid, ppid):
+        continue
+    pid = int(p)
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            args = [a.decode('utf-8', 'ignore') for a in f.read().split(b'\\x00') if a]
+        has_exec = any('mslurm-executor' in a for a in args)
+        has_jid = False
+        for i, a in enumerate(args):
+            if (a == '--job-id' and i + 1 < len(args) and args[i+1] == target_jid) or a == f'--job-id={target_jid}':
+                has_jid = True
+                break
+        if has_exec and has_jid:
+            pids.add(pid)
+        if target_sid is not None:
+            try:
+                if os.getsid(pid) == target_sid:
+                    pids.add(pid)
+            except Exception:
+                pass
+    except Exception:
+        continue
+
+for pid in pids:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        pass
+'''
+
+def probe_remote_liveness(ssh_target, jid, sid=None, pgid=None):
+    """
+    Probes remote node via SSH to determine if executor or any process in the session is alive.
+    Uses exact /proc parsing to prevent matching probe's own shell or other jobs' prefixes.
+    Returns:
+        0: Process or session is ALIVE on the remote node.
+        1: Confirmed DEAD (SSH connected, no matching process found).
+        255 (or other): Transport / SSH error (could not connect; cannot determine state).
+    """
+    target_sid = sid or pgid
+    quoted_code = shlex.quote(REMOTE_PROBE_SCRIPT)
+    remote_cmd = f"export PATH=/opt/conda/envs/stack-share/bin:/usr/bin:$PATH; python3 -c {quoted_code} {jid} {target_sid}"
+    cmd = [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+        ssh_target, remote_cmd
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode
+    except Exception as e:
+        logging.error(f"SSH probe exception for job {jid} on {ssh_target}: {e}")
+        return 255
+
+def kill_remote_job(ssh_target, jid, sid=None, pgid=None):
+    """
+    Sends SIGTERM only to exact matching executor process and session.
+    Avoids wildcard pkill that could inadvertently match other jobs.
+    """
+    target_sid = sid or pgid
+    quoted_code = shlex.quote(REMOTE_KILL_SCRIPT)
+    remote_cmd = f"export PATH=/opt/conda/envs/stack-share/bin:/usr/bin:$PATH; python3 -c {quoted_code} {jid} {target_sid}"
+    cmd = [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+        ssh_target, remote_cmd
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logging.error(f"SSH kill exception for job {jid} on {ssh_target}: {e}")
+
+def main():
+    # [R8 FIX] Single-instance lock
+    var_dir = os.path.join(BASE_DIR, "var")
+    lock_file = environ.get("MSLURM_LOCK_FILE", os.path.join(var_dir, "mslurm-sched.lock"))
+    if environ.get("MSLURM_NO_LOCK") != "1":
+        try:
+            import fcntl
+            lock_fp = open(lock_file, "w")
+            fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, IOError):
+            sys.stderr.write("mslurm-sched: another instance of scheduler is already running.\n")
+            sys.exit(1)
+        except ImportError:
+            lock_fp = None
+
+    db_path = os.path.join(BASE_DIR, "var", "mslurm.db")
+    nodes_conf = os.path.join(BASE_DIR, "etc", "nodes.json")
+    backup_path = "/mnt/share/mini-slurm/backup/mslurm_backup.db"
+    shared_jobs_dir = "/mnt/share/mini-slurm/jobs"
+    executor_path = "/mnt/share/mini-slurm/libexec/mslurm-executor"
+
+    db = MiniSlurmDB(db_path)
+    
+    cfg = load_nodes_config(nodes_conf)
+    db.sync_nodes(cfg)
+    logging.info(f"Initialized MiniSlurmDB at {db_path}. Nodes registered: {list(cfg.keys())}")
+
+    last_backup_time = 0
+    last_cfg_check_time = 0
+
+    # [R2 FIX] Local heartbeat tracking (completely decoupled from remote clock skew)
+    local_heartbeats = {}  # {job_id: {"seq": int, "local_seen": float}}
+
+    while running:
+        try:
+            now = time.time()
+
+            # Periodically sync nodes config (every 10s)
+            if now - last_cfg_check_time > 10:
+                cfg = load_nodes_config(nodes_conf)
+                db.sync_nodes(cfg)
+                last_cfg_check_time = now
+
+            # 1. Check active jobs
+            active_jobs = db.list_jobs(active_only=True)
+            for job in active_jobs:
+                jid = job["job_id"]
+                jdir = os.path.join(shared_jobs_dir, str(jid))
+                status_file = os.path.join(jdir, ".status.json")
+                cancel_file = os.path.join(jdir, ".cancel")
+                node_name = job["allocated_node"]
+                node_cfg = cfg.get(node_name, {})
+                ssh_target = node_cfg.get("ssh_target", node_name)
+
+                # Handle cancellation if job is CANCEL_REQUESTED
+                if job["status"] == "CANCEL_REQUESTED":
+                    # Ensure cancel file exists on shared storage
+                    if not os.path.exists(cancel_file):
+                        os.makedirs(jdir, exist_ok=True)
+                        with open(cancel_file, "w") as cf:
+                            cf.write("CANCEL")
+
+                    # If status file exists and shows terminal state, finalize
+                    if os.path.exists(status_file):
+                        try:
+                            with open(status_file, "r") as f:
+                                sdata = json.load(f)
+                            if sdata.get("status") in ("COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"):
+                                db.finish_job(jid, "CANCELLED", sdata.get("exit_code", 130), "Cancelled by user")
+                                logging.info(f"Job {jid} on {node_name} confirmed cancellation.")
+                                continue
+                        except Exception:
+                            pass
+                    else:
+                        # [R5 FIX] CANCEL_REQUESTED without status file: reconcile with remote node
+                        if ssh_target:
+                            probe = probe_remote_liveness(ssh_target, jid)
+                            if probe == 0:
+                                # Process is running, send TERM signal specifically to this job
+                                kill_remote_job(ssh_target, jid)
+                            elif probe == 1:
+                                # Confirmed: no executor process is running on remote node. Safe to finalize!
+                                logging.info(f"Job {jid} confirmed not running on {node_name}. Reconciling CANCEL_REQUESTED -> CANCELLED.")
+                                db.finish_job(jid, "CANCELLED", 130, "Cancelled before startup confirmed")
+                                continue
+                            else:
+                                # SSH unreachable (255): hold reservation and retry next tick
+                                logging.warning(f"Job {jid} CANCEL_REQUESTED: probe returned {probe} on {ssh_target}. Holding reservation.")
+
+                if os.path.exists(status_file):
+                    try:
+                        with open(status_file, "r") as f:
+                            sdata = json.load(f)
+                        cur_status = sdata.get("status")
+                        
+                        if job["status"] == "STARTING" and cur_status == "RUNNING":
+                            db.mark_job_running(jid, sdata.get("pid"), sdata.get("pgid"))
+                            logging.info(f"Job {jid} on {node_name} is now RUNNING (PID={sdata.get('pid')})")
+
+                        if cur_status in ("COMPLETED", "FAILED", "TIMEOUT", "CANCELLED"):
+                            target_st = "CANCELLED" if job["status"] == "CANCEL_REQUESTED" else cur_status
+                            db.finish_job(jid, target_st, sdata.get("exit_code"), sdata.get("error"))
+                            logging.info(f"Job {jid} finished with status={target_st} exit_code={sdata.get('exit_code')}")
+                            continue
+
+                        # [R2 FIX] Clock-skew-immune heartbeat tracking using local observation
+                        hb_seq = sdata.get("heartbeat_seq", 0)
+                        prev_hb = local_heartbeats.get(jid)
+                        if prev_hb is None or hb_seq != prev_hb["seq"]:
+                            local_heartbeats[jid] = {"seq": hb_seq, "local_seen": now}
+                        local_seen_time = local_heartbeats[jid]["local_seen"]
+
+                        # Check if heartbeat has timed out using 174's local time (> 90s)
+                        if cur_status == "RUNNING" and (now - local_seen_time) > 90:
+                            sid = sdata.get("sid") or sdata.get("pgid")
+                            pid = sdata.get("pid")
+                            probe = probe_remote_liveness(ssh_target, jid, sid=sid, pgid=sdata.get("pgid"))
+                            if probe == 0:
+                                # Remote process or session is ALIVE! Heartbeat was just slow. Do not kill or release!
+                                logging.warning(f"Job {jid} on {node_name} heartbeat delayed, but remote session is confirmed alive.")
+                                local_heartbeats[jid]["local_seen"] = now
+                            elif probe == 1:
+                                # Remote process AND all session processes are confirmed DEAD (exit 1)
+                                logging.warning(f"Job {jid} remote session/PID is confirmed dead without terminal status. Marking FAILED.")
+                                db.finish_job(jid, "FAILED", -1, "Remote process vanished without status")
+                            else:
+                                # Code 255 or other: SSH connection error! Do NOT assume process is dead!
+                                logging.error(f"Job {jid} on {node_name}: SSH probe returned {probe} (network/transport error). Resources preserved.")
+
+                    except Exception as e:
+                        logging.error(f"Error reading status for job {jid}: {e}")
+                else:
+                    # [R1 FIX] Job has no status file yet. Measure timeout from DISPATCH time (not submit time!)
+                    disp_time = job.get("dispatch_time") or job.get("submit_time") or now
+                    if job["status"] == "STARTING" and (now - disp_time) > 60:
+                        # Before failing and releasing, probe remote node to confirm it isn't running!
+                        if ssh_target:
+                            probe = probe_remote_liveness(ssh_target, jid)
+                            if probe == 0:
+                                logging.warning(f"Job {jid} on {node_name} startup timeout reached, but executor is confirmed running. Waiting for status.")
+                            elif probe == 1:
+                                logging.error(f"Job {jid} failed to start on {node_name} within 60s (confirmed no process).")
+                                db.finish_job(jid, "FAILED", -1, "Failed to launch remote executor within 60s")
+                            else:
+                                logging.error(f"Job {jid} on {node_name}: startup timeout probe returned {probe}. Resources preserved.")
+                        else:
+                            db.finish_job(jid, "FAILED", -1, "Invalid node configuration for job")
+
+            # 2. Schedule pending jobs
+            pending = db.get_pending_jobs()
+            for pjob in pending:
+                jid = pjob["job_id"]
+                alloc = db.try_allocate_job(jid)
+                if not alloc:
+                    continue
+
+                # Re-verify if job was cancelled while in queue
+                fresh_job = db.get_job(jid)
+                if fresh_job and fresh_job["status"] == "CANCEL_REQUESTED":
+                    db.finish_job(jid, "CANCELLED", 130, "Cancelled before dispatch")
+                    logging.info(f"Job {jid} cancelled before SSH dispatch.")
+                    continue
+
+                node_name = alloc["node_name"]
+                ssh_target = alloc["ssh_target"]
+                python_bin = alloc["python_bin"]
+                gpus_str = ",".join(str(g) for g in alloc["allocated_gpus"])
+                cpus = alloc["allocated_cpus"]
+
+                jdir = os.path.join(shared_jobs_dir, str(jid))
+                os.makedirs(jdir, exist_ok=True)
+                script_file = os.path.join(jdir, "job.sh")
+                with open(script_file, "w", encoding="utf-8") as sf:
+                    sf.write(pjob["script_content"])
+                os.chmod(script_file, 0o755)
+
+                stdout_path = pjob["stdout_path"] or os.path.join(jdir, "slurm.out")
+                stderr_path = pjob["stderr_path"] or os.path.join(jdir, "slurm.err")
+                stdout_path = stdout_path.replace("%j", str(jid))
+                stderr_path = stderr_path.replace("%j", str(jid))
+
+                # Safe shell escaping for all arguments
+                escaped_script = shlex.quote(script_file)
+                escaped_chdir = shlex.quote(pjob['chdir'])
+                escaped_stdout = shlex.quote(stdout_path)
+                escaped_stderr = shlex.quote(stderr_path)
+                escaped_gpus = shlex.quote(gpus_str)
+                escaped_exec_log = shlex.quote(os.path.join(jdir, "executor.log"))
+
+                remote_cmd = (
+                    f"nohup {python_bin} {executor_path} "
+                    f"--job-id {jid} "
+                    f"--script {escaped_script} "
+                    f"--chdir {escaped_chdir} "
+                    f"--stdout {escaped_stdout} "
+                    f"--stderr {escaped_stderr} "
+                    f"--gpus {escaped_gpus} "
+                    f"--cpus {cpus} "
+                    f"--timeout {pjob['time_limit_sec']} "
+                    f"> {escaped_exec_log} 2>&1 &"
+                )
+
+                launch_cmd = [
+                    "ssh", "-f", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                    ssh_target, remote_cmd
+                ]
+
+                logging.info(f"Dispatching Job {jid} ({pjob['name']}) to {node_name} (GPUs: [{gpus_str}], CPUs: {cpus})")
+                res = subprocess.run(launch_cmd)
+                
+                # [R1 FIX] If SSH launch returned non-zero, probe remote node to confirm liveness
+                if res.returncode != 0:
+                    logging.error(f"SSH launch returned {res.returncode} for job {jid} on {ssh_target}")
+                    probe = probe_remote_liveness(ssh_target, jid)
+                    if probe == 0:
+                        logging.info(f"Job {jid} on {ssh_target}: process started despite launch code {res.returncode}. Resources preserved.")
+                    elif probe == 1:
+                        logging.error(f"Job {jid} on {ssh_target}: launch failed and confirmed no process running.")
+                        db.finish_job(jid, "FAILED", -1, f"SSH launch failed with code {res.returncode}")
+                    else:
+                        logging.error(f"Job {jid} on {ssh_target}: probe returned {probe}. Resources preserved.")
+
+            # 3. Periodic backup (every 300s)
+            if now - last_backup_time > 300:
+                try:
+                    db.backup(backup_path)
+                    last_backup_time = now
+                except Exception as e:
+                    logging.error(f"Backup failed: {e}")
+
+        except Exception as e:
+            logging.error(f"Scheduler loop error: {e}")
+
+        time.sleep(2)
+
+if __name__ == "__main__":
+    main()

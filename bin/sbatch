@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+import sys
+import os
+import argparse
+import getpass
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(BASE_DIR, "lib"))
+
+from mslurm_db import MiniSlurmDB
+from mslurm_parser import parse_sbatch_script
+
+def main():
+    parser = argparse.ArgumentParser(description="Mini-Slurm sbatch")
+    parser.add_argument("script", help="Path to sbatch script, or '-' to read from stdin")
+    parser.add_argument("--parsable", action="store_true", help="Only output job ID")
+    parser.add_argument("--job-name", "-J", help="Override job name")
+    parser.add_argument("--chdir", "-D", help="Override working directory")
+    parser.add_argument("--output", "-o", help="Override stdout log path")
+    parser.add_argument("--error", "-e", help="Override stderr log path")
+    args = parser.parse_args()
+
+    default_chdir = os.getcwd()
+    try:
+        if args.script == "-":
+            content = sys.stdin.read()
+            params, content = parse_sbatch_script(content, is_content=True, default_chdir=default_chdir)
+        else:
+            if not os.path.exists(args.script):
+                sys.stderr.write(f"sbatch: error: Batch script not found: {args.script}\n")
+                sys.exit(1)
+            params, content = parse_sbatch_script(args.script, is_content=False, default_chdir=default_chdir)
+
+        # CLI overrides
+        if args.job_name:
+            params["job_name"] = args.job_name
+        if args.chdir:
+            params["chdir"] = args.chdir
+        if args.output:
+            params["stdout"] = args.output
+        if args.error:
+            params["stderr"] = args.error
+
+        user = getpass.getuser()
+        db_path = os.path.join(BASE_DIR, "var", "mslurm.db")
+        db = MiniSlurmDB(db_path)
+
+        job_id = db.submit_job(
+            name=params["job_name"],
+            user=user,
+            req_cpus=params["cpus_per_task"],
+            req_mem_mb=params["mem_mb"],
+            req_gpus=params["gpus"],
+            gres_model=params["gres_model"],
+            time_limit_sec=params["time_sec"],
+            chdir=params["chdir"],
+            script_content=content,
+            stdout_path=params["stdout"],
+            stderr_path=params["stderr"]
+        )
+
+        if args.parsable:
+            print(job_id)
+        else:
+            print(f"Submitted batch job {job_id}")
+
+    except Exception as e:
+        sys.stderr.write(f"sbatch: error: {e}\n")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

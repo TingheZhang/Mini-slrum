@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+import sys
+import os
+import argparse
+import json
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(BASE_DIR, "lib"))
+
+from mslurm_db import MiniSlurmDB
+
+def main():
+    parser = argparse.ArgumentParser(description="Mini-Slurm sinfo")
+    parser.add_argument("--json", action="store_true", help="Output JSON format")
+    args = parser.parse_args()
+
+    db_path = os.path.join(BASE_DIR, "var", "mslurm.db")
+    db = MiniSlurmDB(db_path)
+
+    nodes = db.list_nodes()
+
+    if args.json:
+        print(json.dumps(nodes, indent=2))
+        return
+
+    header = f"{'NODELIST':<12} {'STATE':<8} {'CPUS(A/I/T)':<14} {'MEM(A/T MB)':<18} {'GPUS(A/T)':<12} {'GPU_MODELS':<20}"
+    print(header)
+
+    for n in nodes:
+        name = n["name"]
+        st = n["status"]
+        t_cpus = n["total_cpus"]
+        a_cpus = n["allocated_cpus"]
+        i_cpus = max(0, t_cpus - a_cpus)
+        cpus_str = f"{a_cpus}/{i_cpus}/{t_cpus}"
+
+        t_mem = n["total_mem_mb"]
+        a_mem = n["allocated_mem_mb"]
+        mem_str = f"{a_mem}/{t_mem}"
+
+        t_gpus = n["gpu_count"]
+        a_gpus = len(n["busy_gpus"])
+        gpus_str = f"{a_gpus}/{t_gpus}"
+
+        models = set(g["model"] for g in n["gpus"])
+        model_str = ",".join(models) if models else "none"
+
+        print(f"{name:<12} {st:<8} {cpus_str:<14} {mem_str:<18} {gpus_str:<12} {model_str:<20}")
+
+if __name__ == "__main__":
+    main()

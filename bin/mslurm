@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+import sys
+import os
+import argparse
+import json
+import subprocess
+import time
+import signal
+import fcntl
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PID_FILE = os.path.join(BASE_DIR, "var", "mslurm-sched.pid")
+LOG_FILE = os.path.join(BASE_DIR, "var", "mslurm-sched.log")
+LOCK_FILE = os.path.join(BASE_DIR, "var", "mslurm-sched.lock")
+SCHED_BIN = os.path.join(BASE_DIR, "sbin", "mslurm-sched")
+
+CAPABILITIES = {
+    "version": "1.1.0",
+    "scheduler": "Mini-Slurm (174 Host Controller)",
+    "supported_directives": [
+        "#SBATCH --job-name=NAME (-J)",
+        "#SBATCH --cpus-per-task=N (-c)",
+        "#SBATCH --mem=SIZE (e.g. 16G, 64GB)",
+        "#SBATCH --gres=gpu:N or --gres=gpu:MODEL:N",
+        "#SBATCH --time=HH:MM:SS (-t, D-HH, D-HH:MM, D-HH:MM:SS)",
+        "#SBATCH --chdir=PATH (-D)",
+        "#SBATCH --output=PATH (-o, supports %j)",
+        "#SBATCH --error=PATH (-e, supports %j)",
+        "#SBATCH --nodes=1 (-N)",
+        "#SBATCH --ntasks=1 (-n)"
+    ],
+    "supported_gpu_models": ["a100", "a800", "rtx6000", "rtx2080ti"],
+    "cli_commands": ["sbatch", "squeue", "sinfo", "sacct", "scancel", "mslurm"],
+    "features": [
+        "atomic_resource_reservation",
+        "idempotent_resource_release",
+        "isolated_session_and_process_group_execution",
+        "cuda_visible_devices_injection",
+        "persistent_sqlite_ledger_with_wal",
+        "shared_nfs_logs_and_status",
+        "strict_input_range_validation",
+        "dispatch_time_start_timeout",
+        "ssh_transport_failure_protection",
+        "thorough_process_group_reap",
+        "graceful_and_force_cancellation"
+    ]
+}
+
+def get_daemon_pid():
+    if not os.path.exists(PID_FILE):
+        return None
+    try:
+        with open(PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except:
+        return None
+
+def cmd_start():
+    pid = get_daemon_pid()
+    if pid:
+        print(f"mslurm-sched is already running (PID {pid})")
+        return
+    
+    # Check lock file
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, "r") as lf:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lf, fcntl.LOCK_UN)
+        except (BlockingIOError, IOError):
+            print("mslurm-sched is locked by another running instance.")
+            return
+    
+    os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+    log_f = open(LOG_FILE, "a")
+    proc = subprocess.Popen(
+        [sys.executable, SCHED_BIN],
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        preexec_fn=os.setsid
+    )
+    with open(PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+    time.sleep(1)
+    if get_daemon_pid():
+        print(f"mslurm-sched started successfully (PID {proc.pid})")
+    else:
+        print("Failed to start mslurm-sched. Check log:", LOG_FILE)
+
+def cmd_stop():
+    pid = get_daemon_pid()
+    if not pid:
+        print("mslurm-sched is not running")
+        return
+    print(f"Stopping mslurm-sched (PID {pid})...")
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(10):
+            time.sleep(0.5)
+            if not get_daemon_pid():
+                break
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except:
+        pass
+    if os.path.exists(PID_FILE):
+        os.remove(PID_FILE)
+    print("mslurm-sched stopped.")
+
+def cmd_status():
+    pid = get_daemon_pid()
+    if pid:
+        print(f"mslurm-sched is RUNNING (PID {pid})")
+        print(f"Log file: {LOG_FILE}")
+    else:
+        print("mslurm-sched is STOPPED")
+
+def cmd_capabilities():
+    print(json.dumps(CAPABILITIES, indent=2))
+
+def cmd_log(n=30):
+    if not os.path.exists(LOG_FILE):
+        print("No log file found.")
+        return
+    subprocess.run(["tail", f"-n{n}", LOG_FILE])
+
+def main():
+    parser = argparse.ArgumentParser(description="Mini-Slurm Service & Capabilities Manager")
+    subparsers = parser.add_subparsers(dest="action")
+
+    subparsers.add_parser("capabilities", help="Show system capabilities and supported parameters in JSON")
+    subparsers.add_parser("start", help="Start scheduler daemon in background")
+    subparsers.add_parser("stop", help="Stop scheduler daemon")
+    subparsers.add_parser("restart", help="Restart scheduler daemon")
+    subparsers.add_parser("status", help="Check daemon status")
+    
+    log_p = subparsers.add_parser("log", help="Tail scheduler log")
+    log_p.add_argument("-n", type=int, default=30, help="Number of lines")
+
+    args = parser.parse_args()
+
+    if args.action == "capabilities":
+        cmd_capabilities()
+    elif args.action == "start":
+        cmd_start()
+    elif args.action == "stop":
+        cmd_stop()
+    elif args.action == "restart":
+        cmd_stop()
+        cmd_start()
+    elif args.action == "status":
+        cmd_status()
+    elif args.action == "log":
+        cmd_log(args.n)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,47 @@
+{
+  "nodes": {
+    "a800": {
+      "ssh_target": "a800",
+      "python_bin": "/opt/conda/envs/stack-share/bin/python",
+      "cpus": 24,
+      "mem_mb": 120000,
+      "gpus": [
+        {"id": 0, "model": "a100", "aliases": ["a800", "a100", "a100-80gb", "a100-sxm4-80gb"]},
+        {"id": 1, "model": "a100", "aliases": ["a800", "a100", "a100-80gb", "a100-sxm4-80gb"]},
+        {"id": 2, "model": "a100", "aliases": ["a800", "a100", "a100-80gb", "a100-sxm4-80gb"]},
+        {"id": 3, "model": "a100", "aliases": ["a800", "a100", "a100-80gb", "a100-sxm4-80gb"]},
+        {"id": 4, "model": "a100", "aliases": ["a800", "a100", "a100-80gb", "a100-sxm4-80gb"]},
+        {"id": 5, "model": "a100", "aliases": ["a800", "a100", "a100-80gb", "a100-sxm4-80gb"]},
+        {"id": 6, "model": "a100", "aliases": ["a800", "a100", "a100-80gb", "a100-sxm4-80gb"]},
+        {"id": 7, "model": "a100", "aliases": ["a800", "a100", "a100-80gb", "a100-sxm4-80gb"]}
+      ],
+      "enabled": true
+    },
+    "172share": {
+      "ssh_target": "172share",
+      "python_bin": "/opt/conda/envs/stack-share/bin/python",
+      "cpus": 24,
+      "mem_mb": 120000,
+      "gpus": [
+        {"id": 0, "model": "rtx6000", "aliases": ["rtx6000", "blackwell"]},
+        {"id": 1, "model": "rtx6000", "aliases": ["rtx6000", "blackwell"]},
+        {"id": 2, "model": "rtx6000", "aliases": ["rtx6000", "blackwell"]},
+        {"id": 3, "model": "rtx6000", "aliases": ["rtx6000", "blackwell"]}
+      ],
+      "enabled": true
+    },
+    "176": {
+      "ssh_target": "176",
+      "python_bin": "/opt/conda/envs/stack-share/bin/python",
+      "cpus": 24,
+      "mem_mb": 120000,
+      "gpus": [
+        {"id": 0, "model": "rtx2080ti", "aliases": ["rtx2080ti", "2080ti"]},
+        {"id": 1, "model": "rtx2080ti", "aliases": ["rtx2080ti", "2080ti"]},
+        {"id": 2, "model": "rtx2080ti", "aliases": ["rtx2080ti", "2080ti"]},
+        {"id": 3, "model": "rtx2080ti", "aliases": ["rtx2080ti", "2080ti"]}
+      ],
+      "enabled": true
+    }
+  }
+}

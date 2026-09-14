@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+import sys
+import os
+import argparse
+import subprocess
+import time
+import json
+import signal
+
+def get_session_pids(sid):
+    pids = []
+    if not sid:
+        return pids
+    try:
+        for entry in os.listdir("/proc"):
+            if entry.isdigit():
+                p = int(entry)
+                if p == os.getpid():
+                    continue
+                try:
+                    if os.getsid(p) == sid:
+                        pids.append(p)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    except Exception:
+        pass
+    return pids
+
+def get_child_pids(parent_pid):
+    children = []
+    try:
+        for entry in os.listdir("/proc"):
+            if entry.isdigit():
+                p = int(entry)
+                if p == parent_pid:
+                    continue
+                try:
+                    with open(f"/proc/{p}/status", "r") as f:
+                        for line in f:
+                            if line.startswith("PPid:"):
+                                ppid = int(line.split()[1])
+                                if ppid == parent_pid:
+                                    children.append(p)
+                                break
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return children
+
+def kill_session_tree(sid, pgid, graceful_wait=1.0):
+    if pgid:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    if sid:
+        for p in get_session_pids(sid):
+            try:
+                os.kill(p, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    # Direct children of executor
+    for cp in get_child_pids(os.getpid()):
+        try:
+            os.killpg(cp, signal.SIGTERM)
+        except Exception:
+            pass
+        try:
+            os.kill(cp, signal.SIGTERM)
+        except Exception:
+            pass
+
+    deadline = time.time() + graceful_wait
+    while time.time() < deadline:
+        if sid and not get_session_pids(sid):
+            break
+        time.sleep(0.1)
+
+    if pgid:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if sid:
+        for p in get_session_pids(sid):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    for cp in get_child_pids(os.getpid()):
+        try:
+            os.killpg(cp, signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            os.kill(cp, signal.SIGKILL)
+        except Exception:
+            pass
+
+    # Signal delivery is not yet proof of exit. Keep the job nonterminal until
+    # its session has no live processes (zombies no longer consume resources).
+    deadline = time.monotonic() + 5.0
+    while True:
+        remaining = []
+        for pid in set(get_session_pids(sid) + get_child_pids(os.getpid())):
+            try:
+                with open(f"/proc/{pid}/stat", "r") as f:
+                    state = f.read().rsplit(") ", 1)[1].split()[0]
+                if state not in ("Z", "X"):
+                    remaining.append(pid)
+            except (ProcessLookupError, FileNotFoundError):
+                pass
+        if not remaining:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Job cleanup incomplete; live PIDs: {remaining}")
+        time.sleep(0.05)
+
+def write_status(status_file, data):
+    tmp_file = status_file + ".tmp"
+    try:
+        with open(tmp_file, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_file, status_file)
+    except Exception as e:
+        sys.stderr.write(f"Error writing status file: {e}\n")
+
+def main():
+    parser = argparse.ArgumentParser(description="Mini-Slurm Remote Task Executor")
+    parser.add_argument("--job-id", type=int, required=True)
+    parser.add_argument("--script", required=True)
+    parser.add_argument("--chdir", default=".")
+    parser.add_argument("--stdout", required=True)
+    parser.add_argument("--stderr", required=True)
+    parser.add_argument("--gpus", default="")
+    parser.add_argument("--cpus", type=int, default=1)
+    parser.add_argument("--timeout", type=int, default=0)
+    args = parser.parse_args()
+
+    job_id = args.job_id
+    job_dir = os.path.dirname(args.script)
+    status_file = os.path.join(job_dir, ".status.json")
+    cancel_file = os.path.join(job_dir, ".cancel")
+
+    os.makedirs(job_dir, exist_ok=True)
+    if args.chdir and os.path.isdir(args.chdir):
+        os.chdir(args.chdir)
+
+    # [R3 FIX] Check cancel marker BEFORE launching user process
+    if os.path.exists(cancel_file):
+        sys.stderr.write(f"[mslurm-executor] Job {job_id} was cancelled before launch\n")
+        now = time.time()
+        status_data = {
+            "job_id": job_id,
+            "status": "CANCELLED",
+            "node_hostname": os.uname().nodename,
+            "pid": None,
+            "pgid": None,
+            "sid": None,
+            "gpus": args.gpus,
+            "cpus": args.cpus,
+            "start_time": now,
+            "last_heartbeat": now,
+            "heartbeat_seq": 1,
+            "exit_code": 130,
+            "error": "Job cancelled prior to execution",
+            "end_time": now
+        }
+        write_status(status_file, status_data)
+        sys.exit(0)
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.stdout)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.stderr)), exist_ok=True)
+
+    env = os.environ.copy()
+    env["SLURM_JOB_ID"] = str(job_id)
+    env["SLURM_JOBID"] = str(job_id)
+    env["SLURM_CPUS_PER_TASK"] = str(args.cpus)
+    env["OMP_NUM_THREADS"] = str(args.cpus)
+    env["MKL_NUM_THREADS"] = str(args.cpus)
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+
+    if args.gpus != "":
+        env["CUDA_VISIBLE_DEVICES"] = str(args.gpus)
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = ""
+
+    stdout_f = open(args.stdout, "a", buffering=1)
+    stderr_f = open(args.stderr, "a", buffering=1)
+
+    start_time = time.time()
+    heartbeat_seq = 1
+    node_name = os.uname().nodename
+
+    proc = None
+    pgid = None
+    sid = None
+
+    status_data = {
+        "job_id": job_id,
+        "status": "STARTING",
+        "node_hostname": node_name,
+        "pid": None,
+        "pgid": None,
+        "sid": None,
+        "gpus": args.gpus,
+        "cpus": args.cpus,
+        "start_time": start_time,
+        "last_heartbeat": start_time,
+        "heartbeat_seq": heartbeat_seq,
+        "exit_code": None,
+        "error": None
+    }
+
+    final_status = "COMPLETED"
+    exit_code = None
+    termination_requested = False
+
+    # [T3 FIX] Handle termination signals BEFORE subprocess.Popen is called
+    def sig_handler(signum, frame):
+        nonlocal termination_requested
+        # Finish Popen/SID registration before cleanup; do not reenter cleanup
+        # on another signal while the process tree is being terminated.
+        termination_requested = True
+
+    signal.signal(signal.SIGTERM, sig_handler)
+    signal.signal(signal.SIGINT, sig_handler)
+
+    try:
+        if termination_requested or os.path.exists(cancel_file):
+            final_status = "CANCELLED"
+            exit_code = 130
+            sys.exit(130 if termination_requested else 0)
+        # Launch script in a brand new session and process group
+        proc = subprocess.Popen(
+            ["/bin/bash", args.script],
+            cwd=args.chdir,
+            env=env,
+            stdout=stdout_f,
+            stderr=stderr_f,
+            preexec_fn=os.setsid
+        )
+
+        pgid = os.getpgid(proc.pid)
+        sid = pgid  # With setsid, pgid == sid == pid of the session leader
+        status_data["status"] = "RUNNING"
+        status_data["pid"] = proc.pid
+        status_data["pgid"] = pgid
+        status_data["sid"] = sid
+        write_status(status_file, status_data)
+
+        while True:
+            now = time.time()
+            if termination_requested or os.path.exists(cancel_file):
+                sys.stderr.write(f"[mslurm-executor] Job {job_id} cancelled by user request\n")
+                kill_session_tree(sid, pgid, graceful_wait=1.5)
+                final_status = "CANCELLED"
+                exit_code = 130
+                break
+
+            # Check timeout
+            if args.timeout > 0 and (now - start_time) > args.timeout:
+                sys.stderr.write(f"[mslurm-executor] Job {job_id} timed out after {args.timeout}s\n")
+                kill_session_tree(sid, pgid, graceful_wait=1.5)
+                final_status = "TIMEOUT"
+                exit_code = 124
+                break
+
+            ret = proc.poll()
+            if ret is not None:
+                exit_code = ret
+                if os.path.exists(cancel_file) or ret in (-15, -9, 130, 143):
+                    final_status = "CANCELLED"
+                    exit_code = 130 if ret in (-15, -9) else ret
+                else:
+                    final_status = "COMPLETED" if ret == 0 else "FAILED"
+                break
+
+            # Update heartbeat
+            heartbeat_seq += 1
+            status_data["last_heartbeat"] = now
+            status_data["heartbeat_seq"] = heartbeat_seq
+            write_status(status_file, status_data)
+            time.sleep(3)
+
+    except Exception as e:
+        kill_session_tree(sid, pgid, graceful_wait=0.5)
+        final_status = "FAILED"
+        exit_code = 1
+        status_data["error"] = str(e)
+    finally:
+        # [R4 FIX] Clean up ALL processes belonging to the session tree
+        kill_session_tree(sid, pgid, graceful_wait=0.5)
+        if proc is not None:
+            proc.wait(timeout=5)
+        if termination_requested:
+            final_status = "CANCELLED"
+            exit_code = 130
+
+        stdout_f.close()
+        stderr_f.close()
+        status_data["status"] = final_status
+        status_data["exit_code"] = exit_code
+        status_data["end_time"] = time.time()
+        heartbeat_seq += 1
+        status_data["heartbeat_seq"] = heartbeat_seq
+        write_status(status_file, status_data)
+
+    if termination_requested:
+        sys.exit(130)
+
+if __name__ == "__main__":
+    main()
