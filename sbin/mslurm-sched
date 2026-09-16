@@ -8,6 +8,7 @@ import signal
 import subprocess
 import logging
 import shlex
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE_DIR, "lib"))
@@ -153,6 +154,99 @@ def kill_remote_job(ssh_target, jid, sid=None, pgid=None):
     except Exception as e:
         logging.error(f"SSH kill exception for job {jid} on {ssh_target}: {e}")
 
+def probe_single_node_telemetry(ssh_target, timeout=5):
+    """
+    Probes remote node via nvidia-smi.
+    Returns {gpu_id: {"used_mb": int, "total_mb": int, "util": int}} or None.
+    """
+    remote_cmd = "export PATH=/usr/local/cuda/bin:/usr/bin:/bin:$PATH; nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits"
+    cmd = [
+        "ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}",
+        ssh_target, remote_cmd
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+        if res.returncode != 0:
+            return None
+        telemetry = {}
+        for line in res.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 4:
+                try:
+                    gid = int(parts[0])
+                    used_mb = int(parts[1])
+                    total_mb = int(parts[2])
+                    util = int(parts[3])
+                    telemetry[str(gid)] = {
+                        "used_mb": used_mb,
+                        "total_mb": total_mb,
+                        "util": util
+                    }
+                except (ValueError, IndexError):
+                    continue
+        return telemetry
+    except Exception as e:
+        return None
+
+def refresh_cluster_telemetry(db, cfg, active_jobs, timeout=5):
+    """
+    Concurrently probes all UP nodes for physical GPU telemetry.
+    Updates DB with ext_busy and slurm_job_id flags.
+    """
+    slurm_gpu_map = {}
+    for job in active_jobs:
+        n = job.get("allocated_node")
+        gpus_str = job.get("allocated_gpus")
+        if n and gpus_str:
+            for g in str(gpus_str).split(","):
+                try:
+                    slurm_gpu_map[(n, int(g))] = job["job_id"]
+                except ValueError:
+                    pass
+
+    nodes_to_probe = {}
+    for name, ncfg in cfg.items():
+        if ncfg.get("enabled", True) and ncfg.get("gpus"):
+            ssh_target = ncfg.get("ssh_target", name)
+            nodes_to_probe[name] = ssh_target
+
+    if not nodes_to_probe:
+        return
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(nodes_to_probe))) as executor:
+        future_to_node = {
+            executor.submit(probe_single_node_telemetry, target, timeout): name
+            for name, target in nodes_to_probe.items()
+        }
+        for future in as_completed(future_to_node):
+            node_name = future_to_node[future]
+            try:
+                res = future.result()
+                if res is not None:
+                    results[node_name] = res
+            except Exception:
+                pass
+
+    for node_name, telemetry in results.items():
+        for gid_str, info in telemetry.items():
+            gid = int(gid_str)
+            slurm_jid = slurm_gpu_map.get((node_name, gid))
+            if slurm_jid is not None:
+                info["status"] = "ALLOCATED"
+                info["slurm_job_id"] = slurm_jid
+                info["ext_busy"] = False
+            elif info.get("used_mb", 0) > 1000:
+                info["status"] = "EXT_BUSY"
+                info["slurm_job_id"] = None
+                info["ext_busy"] = True
+            else:
+                info["status"] = "IDLE"
+                info["slurm_job_id"] = None
+                info["ext_busy"] = False
+
+        db.update_node_telemetry(node_name, telemetry)
+
 def main():
     # [R8 FIX] Single-instance lock
     var_dir = os.path.join(BASE_DIR, "var")
@@ -182,6 +276,7 @@ def main():
 
     last_backup_time = 0
     last_cfg_check_time = 0
+    last_telemetry_time = 0
 
     # [R2 FIX] Local heartbeat tracking (completely decoupled from remote clock skew)
     local_heartbeats = {}  # {job_id: {"seq": int, "local_seen": float}}
@@ -301,8 +396,17 @@ def main():
                         else:
                             db.finish_job(jid, "FAILED", -1, "Invalid node configuration for job")
 
-            # 2. Schedule pending jobs
+            # 2. Refresh physical telemetry if needed (every 10s or 5s if pending jobs exist)
             pending = db.get_pending_jobs()
+            telemetry_interval = 5 if pending else 10
+            if now - last_telemetry_time > telemetry_interval:
+                try:
+                    refresh_cluster_telemetry(db, cfg, active_jobs)
+                    last_telemetry_time = now
+                except Exception as e:
+                    logging.error(f"Error refreshing cluster telemetry: {e}")
+
+            # 3. Schedule pending jobs
             for pjob in pending:
                 jid = pjob["job_id"]
                 alloc = db.try_allocate_job(jid)

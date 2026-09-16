@@ -14,7 +14,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     gpu_count INTEGER,
     gpu_info TEXT,
     status TEXT DEFAULT 'UP',
-    last_heartbeat REAL
+    last_heartbeat REAL,
+    gpu_telemetry TEXT,
+    telemetry_updated_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -181,6 +183,23 @@ class MiniSlurmDB:
             conn.execute("INSERT INTO cpu_mem_allocations (node_name, allocated_cpus, allocated_mem_mb) SELECT node_name, MAX(0, allocated_cpus), MAX(0, allocated_mem_mb) FROM _cma_old;")
             conn.execute("DROP TABLE _cma_old;")
 
+        # 3. Ensure nodes table has gpu_telemetry and telemetry_updated_at columns
+        node_cols = [r[1] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()]
+        if "gpu_telemetry" not in node_cols:
+            conn.execute("ALTER TABLE nodes ADD COLUMN gpu_telemetry TEXT")
+        if "telemetry_updated_at" not in node_cols:
+            conn.execute("ALTER TABLE nodes ADD COLUMN telemetry_updated_at REAL")
+
+    def update_node_telemetry(self, node_name, telemetry_dict):
+        """Updates real-time physical GPU telemetry for a node."""
+        now = time.time()
+        with self.get_conn() as conn:
+            conn.execute("""
+                UPDATE nodes
+                SET gpu_telemetry = ?, telemetry_updated_at = ?
+                WHERE name = ?
+            """, (json.dumps(telemetry_dict), now, node_name))
+
     def sync_nodes(self, nodes_config):
         """
         Synchronizes nodes with nodes_config.
@@ -316,9 +335,27 @@ class MiniSlurmDB:
                     if len(eligible_gpus) < req_gpus:
                         continue
                     
-                    # Find which ones are currently free
+                    # Find which ones are currently free (both from Slurm allocations and external physical occupancy)
                     busy_gpus = [r[0] for r in cur.execute("SELECT gpu_id FROM gpu_allocations WHERE node_name = ?", (node_name,)).fetchall()]
-                    free_gpus = [gid for gid in eligible_gpus if gid not in busy_gpus]
+                    
+                    # Detect externally busy GPUs from physical telemetry
+                    ext_busy_gpus = []
+                    node_dict = dict(node)
+                    if node_dict.get("gpu_telemetry"):
+                        try:
+                            telemetry = json.loads(node_dict["gpu_telemetry"])
+                            for g_str, t_info in telemetry.items():
+                                try:
+                                    g_int = int(g_str)
+                                    if g_int not in busy_gpus:
+                                        if t_info.get("ext_busy") or t_info.get("used_mb", 0) > 1000:
+                                            ext_busy_gpus.append(g_int)
+                                except (ValueError, TypeError):
+                                    pass
+                        except Exception:
+                            pass
+
+                    free_gpus = [gid for gid in eligible_gpus if gid not in busy_gpus and gid not in ext_busy_gpus]
                     
                     if len(free_gpus) < req_gpus:
                         continue
@@ -468,6 +505,27 @@ class MiniSlurmDB:
                 d["allocated_mem_mb"] = alloc["allocated_mem_mb"] if alloc else 0
                 busy_gpus = [r[0] for r in conn.execute("SELECT gpu_id FROM gpu_allocations WHERE node_name = ?", (d["name"],)).fetchall()]
                 d["busy_gpus"] = busy_gpus
+
+                # Parse real-time physical telemetry
+                telemetry = {}
+                if d.get("gpu_telemetry"):
+                    try:
+                        telemetry = json.loads(d["gpu_telemetry"])
+                    except Exception:
+                        telemetry = {}
+                d["telemetry"] = telemetry
+
+                ext_busy_gpus = []
+                for g in d["gpus"]:
+                    gid = g["id"]
+                    t_info = telemetry.get(str(gid)) or telemetry.get(gid)
+                    if t_info and gid not in busy_gpus:
+                        if t_info.get("ext_busy") or t_info.get("used_mb", 0) > 1000:
+                            ext_busy_gpus.append(gid)
+                d["ext_busy_gpus"] = ext_busy_gpus
+
+                all_gpu_ids = [g["id"] for g in d["gpus"]]
+                d["idle_gpus"] = [gid for gid in all_gpu_ids if gid not in busy_gpus and gid not in ext_busy_gpus]
                 res.append(d)
             return res
 

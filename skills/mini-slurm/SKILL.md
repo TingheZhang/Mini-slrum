@@ -20,12 +20,17 @@ Mini-Slurm implements standard Slurm command semantics:
 
 | Command | Purpose | Common Options / Usage |
 | :--- | :--- | :--- |
-| `sinfo` | View cluster nodes, health, CPUs, Memory, and GPU capacity | `sinfo` |
+| `sinfo` | View cluster overview and GPU capacity (`A/E/I/T`) | `sinfo` (summary) or `sinfo -l` (per-GPU VRAM & owner) |
 | `squeue` | Inspect running and pending jobs in the scheduling queue | `squeue` |
 | `sbatch` | Submit a batch script to the queue | `sbatch <script.sbatch>` |
 | `scancel` | Cancel a running or pending job | `scancel <job_id>` |
 | `sacct` | Query job execution history, exit codes, and timestamps | `sacct` or `sacct -j <job_id>` |
 | `mslurm` | Control scheduler daemon (start/stop/restart/status/logs) | `mslurm status`, `mslurm logs` |
+
+> [!NOTE]
+> **Transparent Physical GPU Sensing**:
+> `sinfo` summary reports `GPUS(A/E/I/T)` representing **Allocated by Slurm / Externally Busy / Clean Idle / Total**.
+> `sinfo -l` shows real-time per-GPU physical telemetry (`nvidia-smi`), distinguishing between `IDLE`, `ALLOCATED (Job #ID)`, and `EXT_BUSY (external user)`. The scheduler automatically avoids any cards with `EXT_BUSY` to prevent OOM collisions in shared clusters.
 
 ## Job Script (`.sbatch`) Directives
 

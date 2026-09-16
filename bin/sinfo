@@ -9,12 +9,20 @@ sys.path.insert(0, os.path.join(BASE_DIR, "lib"))
 
 from mslurm_db import MiniSlurmDB
 
+def format_mem(mb):
+    if mb >= 1024 * 10:
+        return f"{mb / 1024:.1f} GiB"
+    elif mb >= 1024:
+        return f"{mb / 1024:.1f} GiB"
+    return f"{mb} MiB"
+
 def main():
-    parser = argparse.ArgumentParser(description="Mini-Slurm sinfo")
+    parser = argparse.ArgumentParser(description="Mini-Slurm sinfo (Cluster & GPU Status)")
+    parser.add_argument("-l", "--long", "--detail", action="store_true", help="Display detailed per-GPU physical telemetry")
     parser.add_argument("--json", action="store_true", help="Output JSON format")
     args = parser.parse_args()
 
-    db_path = os.path.join(BASE_DIR, "var", "mslurm.db")
+    db_path = os.environ.get("MSLURM_DB", os.path.join(BASE_DIR, "var", "mslurm.db"))
     db = MiniSlurmDB(db_path)
 
     nodes = db.list_nodes()
@@ -23,7 +31,56 @@ def main():
         print(json.dumps(nodes, indent=2))
         return
 
-    header = f"{'NODELIST':<12} {'STATE':<8} {'CPUS(A/I/T)':<14} {'MEM(A/T MB)':<18} {'GPUS(A/T)':<12} {'GPU_MODELS':<20}"
+    if args.long:
+        # Detailed per-GPU view
+        header = f"{'NODE':<12} {'GPU':<5} {'MODEL':<14} {'STATUS':<12} {'JOB/OWNER':<14} {'VRAM_USAGE':<24} {'GPU_UTIL':<10}"
+        print(header)
+        print("-" * len(header))
+        has_any_gpus = False
+        for n in nodes:
+            name = n["name"]
+            st = n["status"]
+            gpus = n.get("gpus", [])
+            telemetry = n.get("telemetry", {})
+            busy_gpus = n.get("busy_gpus", [])
+            ext_busy_gpus = n.get("ext_busy_gpus", [])
+
+            for g in gpus:
+                has_any_gpus = True
+                gid = g["id"]
+                model = g.get("model", "unknown")
+                t_info = telemetry.get(str(gid)) or telemetry.get(gid) or {}
+
+                used_mb = t_info.get("used_mb")
+                total_mb = t_info.get("total_mb")
+                util = t_info.get("util")
+
+                if gid in busy_gpus:
+                    status_str = "ALLOCATED"
+                    slurm_jid = t_info.get("slurm_job_id")
+                    job_str = f"Job #{slurm_jid}" if slurm_jid else "Slurm Job"
+                elif gid in ext_busy_gpus or t_info.get("ext_busy"):
+                    status_str = "EXT_BUSY"
+                    job_str = "external"
+                else:
+                    status_str = "IDLE"
+                    job_str = "-"
+
+                if used_mb is not None and total_mb is not None:
+                    vram_str = f"{format_mem(used_mb)} / {format_mem(total_mb)}"
+                else:
+                    vram_str = "N/A"
+
+                util_str = f"{util}%" if util is not None else "N/A"
+
+                print(f"{name:<12} {gid:<5} {model:<14} {status_str:<12} {job_str:<14} {vram_str:<24} {util_str:<10}")
+
+        if not has_any_gpus:
+            print("No GPUs configured in cluster.")
+        return
+
+    # Standard summary view
+    header = f"{'NODELIST':<12} {'STATE':<8} {'CPUS(A/I/T)':<14} {'MEM(A/T MB)':<18} {'GPUS(A/E/I/T)':<16} {'GPU_MODELS':<20}"
     print(header)
 
     for n in nodes:
@@ -39,13 +96,15 @@ def main():
         mem_str = f"{a_mem}/{t_mem}"
 
         t_gpus = n["gpu_count"]
-        a_gpus = len(n["busy_gpus"])
-        gpus_str = f"{a_gpus}/{t_gpus}"
+        a_gpus = len(n.get("busy_gpus", []))
+        e_gpus = len(n.get("ext_busy_gpus", []))
+        idle_gpus = len(n.get("idle_gpus", []))
+        gpus_str = f"{a_gpus}/{e_gpus}/{idle_gpus}/{t_gpus}"
 
         models = set(g["model"] for g in n["gpus"])
         model_str = ",".join(models) if models else "none"
 
-        print(f"{name:<12} {st:<8} {cpus_str:<14} {mem_str:<18} {gpus_str:<12} {model_str:<20}")
+        print(f"{name:<12} {st:<8} {cpus_str:<14} {mem_str:<18} {gpus_str:<16} {model_str:<20}")
 
 if __name__ == "__main__":
     main()
