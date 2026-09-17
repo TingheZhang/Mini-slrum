@@ -228,24 +228,42 @@ def refresh_cluster_telemetry(db, cfg, active_jobs, timeout=5):
             except Exception:
                 pass
 
-    for node_name, telemetry in results.items():
-        for gid_str, info in telemetry.items():
-            gid = int(gid_str)
-            slurm_jid = slurm_gpu_map.get((node_name, gid))
-            if slurm_jid is not None:
-                info["status"] = "ALLOCATED"
-                info["slurm_job_id"] = slurm_jid
-                info["ext_busy"] = False
-            elif info.get("used_mb", 0) > 1000:
-                info["status"] = "EXT_BUSY"
-                info["slurm_job_id"] = None
-                info["ext_busy"] = True
-            else:
-                info["status"] = "IDLE"
-                info["slurm_job_id"] = None
-                info["ext_busy"] = False
+    for node_name in nodes_to_probe:
+        telemetry = results.get(node_name)
+        if telemetry is None:
+            # Probe failed or timed out: mark non-allocated GPUs as UNKNOWN to prevent new allocations
+            node_gpus = cfg.get(node_name, {}).get("gpus", [])
+            telemetry = {}
+            for g in node_gpus:
+                gid = g["id"]
+                slurm_jid = slurm_gpu_map.get((node_name, gid))
+                telemetry[str(gid)] = {
+                    "used_mb": 0,
+                    "total_mb": 0,
+                    "util": 0,
+                    "status": "ALLOCATED" if slurm_jid is not None else "UNKNOWN",
+                    "slurm_job_id": slurm_jid,
+                    "ext_busy": (slurm_jid is None)
+                }
+            db.update_node_telemetry(node_name, telemetry)
+        else:
+            for gid_str, info in telemetry.items():
+                gid = int(gid_str)
+                slurm_jid = slurm_gpu_map.get((node_name, gid))
+                if slurm_jid is not None:
+                    info["status"] = "ALLOCATED"
+                    info["slurm_job_id"] = slurm_jid
+                    info["ext_busy"] = False
+                elif info.get("used_mb", 0) > 1000:
+                    info["status"] = "EXT_BUSY"
+                    info["slurm_job_id"] = None
+                    info["ext_busy"] = True
+                else:
+                    info["status"] = "IDLE"
+                    info["slurm_job_id"] = None
+                    info["ext_busy"] = False
 
-        db.update_node_telemetry(node_name, telemetry)
+            db.update_node_telemetry(node_name, telemetry)
 
 def main():
     # [R8 FIX] Single-instance lock

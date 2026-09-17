@@ -143,6 +143,7 @@ class MiniSlurmDB:
                     req_mem_mb INTEGER DEFAULT 8192 CHECK (req_mem_mb >= 1),
                     req_gpus INTEGER DEFAULT 0 CHECK (req_gpus >= 0),
                     gres_model TEXT,
+                    req_nodelist TEXT,
                     time_limit_sec INTEGER DEFAULT 0 CHECK (time_limit_sec >= 0),
                     chdir TEXT,
                     script_content TEXT,
@@ -262,6 +263,20 @@ class MiniSlurmDB:
         if time_limit_sec < 0:
             raise ValueError(f"time_limit_sec must be >= 0, got {time_limit_sec}")
 
+        if req_nodelist is not None:
+            req_nodelist = req_nodelist.strip()
+            if not req_nodelist:
+                raise ValueError("Option --nodelist/-w cannot be empty")
+            requested_nodes = [n.strip() for n in req_nodelist.split(",") if n.strip()]
+            if not requested_nodes:
+                raise ValueError("Option --nodelist/-w must contain at least one valid node name")
+            with self.get_conn() as conn:
+                known_nodes = set(r[0] for r in conn.execute("SELECT name FROM nodes").fetchall())
+            if known_nodes:
+                for node in requested_nodes:
+                    if node not in known_nodes:
+                        raise ValueError(f"Invalid node '{node}': not found in cluster nodes {sorted(list(known_nodes))}")
+
         now = time.time()
         with self.get_conn() as conn:
             cur = conn.cursor()
@@ -290,6 +305,7 @@ class MiniSlurmDB:
         with self.get_conn() as conn:
             cur = conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
+            now = time.time()
             
             job = cur.execute("SELECT * FROM jobs WHERE job_id = ? AND status = 'PENDING'", (job_id,)).fetchone()
             if not job:
@@ -367,25 +383,42 @@ class MiniSlurmDB:
                     # Find which ones are currently free (both from Slurm allocations and external physical occupancy)
                     busy_gpus = [r[0] for r in cur.execute("SELECT gpu_id FROM gpu_allocations WHERE node_name = ?", (node_name,)).fetchall()]
                     
-                    # Detect externally busy GPUs from physical telemetry
-                    ext_busy_gpus = []
+                    # Telemetry validation & freshness check
                     node_dict = dict(node)
-                    if node_dict.get("gpu_telemetry"):
-                        try:
-                            telemetry = json.loads(node_dict["gpu_telemetry"])
-                            for g_str, t_info in telemetry.items():
-                                try:
-                                    g_int = int(g_str)
-                                    if g_int not in busy_gpus:
-                                        if t_info.get("ext_busy") or t_info.get("used_mb", 0) > 1000:
-                                            ext_busy_gpus.append(g_int)
-                                except (ValueError, TypeError):
-                                    pass
-                        except Exception:
-                            pass
+                    telemetry_raw = node_dict.get("gpu_telemetry")
+                    telemetry_updated_at = node_dict.get("telemetry_updated_at")
 
-                    free_gpus = [gid for gid in eligible_gpus if gid not in busy_gpus and gid not in ext_busy_gpus]
-                    
+                    # Check staleness or historical sample
+                    is_telemetry_stale = False
+                    if telemetry_updated_at is not None:
+                        if (now - telemetry_updated_at > 60) or (telemetry_updated_at <= 1000):
+                            is_telemetry_stale = True
+
+                    # If telemetry is expired/stale, fail closed (cannot allocate GPU on this node)
+                    if is_telemetry_stale:
+                        continue
+
+                    # Validate telemetry content if present
+                    unusable_gpus = set(busy_gpus)
+                    if telemetry_raw is not None:
+                        try:
+                            telemetry = json.loads(telemetry_raw)
+                            if not isinstance(telemetry, dict) or not telemetry:
+                                # Empty or malformed dictionary: invalid telemetry!
+                                continue
+                            for g in eligible_gpus:
+                                g_str = str(g)
+                                t_info = telemetry.get(g_str) or telemetry.get(g)
+                                if not t_info or not isinstance(t_info, dict):
+                                    # Missing entry for this GPU: unknown status!
+                                    unusable_gpus.add(g)
+                                elif t_info.get("status") == "UNKNOWN" or t_info.get("ext_busy") or t_info.get("used_mb", 0) > 1000:
+                                    unusable_gpus.add(g)
+                        except Exception:
+                            # Corrupted JSON: invalid telemetry!
+                            continue
+
+                    free_gpus = [gid for gid in eligible_gpus if gid not in unusable_gpus]
                     if len(free_gpus) < req_gpus:
                         continue
                     allocated_gpu_ids = free_gpus[:req_gpus]

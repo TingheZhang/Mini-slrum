@@ -146,15 +146,24 @@ class TestNodelistConstraint(unittest.TestCase):
             alloc6 = db.try_allocate_job(j6)
             self.assertIsNone(alloc6) # Cannot allocate!
 
-            # Test 7: Nonexistent node (-w fake_node)
-            j7 = db.submit_job(
-                name="fake_node", user="test", req_cpus=4, req_mem_mb=8000,
-                req_gpus=0, gres_model=None, time_limit_sec=60, chdir="/mnt/share",
-                script_content="echo 7", stdout_path=None, stderr_path=None,
-                req_nodelist="fake_node"
-            )
-            alloc7 = db.try_allocate_job(j7)
-            self.assertIsNone(alloc7)
+            # Test 7: Nonexistent node (-w fake_node) must raise ValueError on submit
+            with self.assertRaises(ValueError) as ctx:
+                db.submit_job(
+                    name="fake_node", user="test", req_cpus=4, req_mem_mb=8000,
+                    req_gpus=0, gres_model=None, time_limit_sec=60, chdir="/mnt/share",
+                    script_content="echo 7", stdout_path=None, stderr_path=None,
+                    req_nodelist="fake_node"
+                )
+            self.assertIn("Invalid node 'fake_node'", str(ctx.exception))
+
+            # Test 8: Empty nodelist must raise ValueError
+            with self.assertRaises(ValueError):
+                db.submit_job(
+                    name="empty_node", user="test", req_cpus=4, req_mem_mb=8000,
+                    req_gpus=0, gres_model=None, time_limit_sec=60, chdir="/mnt/share",
+                    script_content="echo 8", stdout_path=None, stderr_path=None,
+                    req_nodelist=""
+                )
 
 if __name__ == "__main__":
     unittest.main()

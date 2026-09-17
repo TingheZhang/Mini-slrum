@@ -45,11 +45,19 @@ def main():
             params["stdout"] = args.output
         if args.error:
             params["stderr"] = args.error
-        if args.nodelist:
-            params["nodelist"] = args.nodelist.strip()
-        if args.constraint:
-            params["gres_model"] = args.constraint.lower().strip()
-        if args.cpus_per_task:
+        if args.nodelist is not None:
+            nl = args.nodelist.strip()
+            if not nl:
+                raise ValueError("Option --nodelist/-w cannot be empty")
+            params["nodelist"] = nl
+        if args.constraint is not None:
+            c = args.constraint.lower().strip()
+            if not c:
+                raise ValueError("Option --constraint/-C cannot be empty")
+            params["constraint"] = c
+        if args.cpus_per_task is not None:
+            if args.cpus_per_task < 1:
+                raise ValueError(f"--cpus-per-task must be >= 1, got: {args.cpus_per_task}")
             params["cpus_per_task"] = args.cpus_per_task
         if args.mem:
             from mslurm_parser import parse_memory_mb
@@ -60,6 +68,10 @@ def main():
             params["gpus"] = g
             if m:
                 params["gres_model"] = m.lower().strip()
+
+        # Reconcile hardware constraints after CLI overrides!
+        from mslurm_parser import reconcile_hardware_constraints
+        params["gres_model"] = reconcile_hardware_constraints(params.get("constraint"), params.get("gres_model"))
 
         user = getpass.getuser()
         db_path = os.path.join(BASE_DIR, "var", "mslurm.db")

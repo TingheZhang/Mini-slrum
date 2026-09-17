@@ -262,7 +262,10 @@ def parse_sbatch_script(script_path_or_content, is_content=False, default_chdir=
             if val is None:
                 val, next_i = get_val(tok, "-C", i + 1)
             if val is not None:
-                params["constraint"] = val.lower().strip()
+                val = val.lower().strip()
+                if not val:
+                    raise ValueError("Option --constraint/-C cannot be empty")
+                params["constraint"] = val
                 i = next_i
                 continue
 
@@ -270,23 +273,46 @@ def parse_sbatch_script(script_path_or_content, is_content=False, default_chdir=
             if val is None:
                 val, next_i = get_val(tok, "-w", i + 1)
             if val is not None:
-                params["nodelist"] = val.strip()
+                val = val.strip()
+                if not val:
+                    raise ValueError("Option --nodelist/-w cannot be empty")
+                params["nodelist"] = val
                 i = next_i
                 continue
 
             # If we reached here, unrecognized option!
             raise ValueError(f"Unknown or unsupported #SBATCH directive: {tok}")
 
-    # Reconcile constraint and gres_model
-    final_model = None
-    if params["constraint"] and params["gres_model"]:
-        if params["constraint"] != params["gres_model"]:
-            raise ValueError(f"Conflicting GPU model requirements: --constraint={params['constraint']} vs --gres={params['gres_model']}")
-        final_model = params["constraint"]
-    elif params["constraint"]:
-        final_model = params["constraint"]
-    elif params["gres_model"]:
-        final_model = params["gres_model"]
-
-    params["gres_model"] = final_model
+    params["gres_model"] = reconcile_hardware_constraints(params.get("constraint"), params.get("gres_model"))
     return params, content
+
+def reconcile_hardware_constraints(constraint, gres_model):
+    """
+    Reconciles -C/--constraint and --gres GPU model requirements.
+    If both are specified, they must be compatible (e.g. identical or alias matches).
+    Raises ValueError if they conflict.
+    Returns the unified model string or None.
+    """
+    if not constraint and not gres_model:
+        return None
+    if constraint and not gres_model:
+        return constraint.lower().strip()
+    if gres_model and not constraint:
+        return gres_model.lower().strip()
+
+    c = constraint.lower().strip()
+    g = gres_model.lower().strip()
+    ALIAS_GROUPS = [
+        {"a100", "a800", "a100-80gb", "a100-sxm4-80gb"},
+        {"rtx2080ti", "2080ti"},
+        {"rtx6000", "blackwell"}
+    ]
+    compatible = (c == g)
+    if not compatible:
+        for group in ALIAS_GROUPS:
+            if c in group and g in group:
+                compatible = True
+                break
+    if not compatible:
+        raise ValueError(f"Conflicting GPU model requirements: --constraint={c} vs --gres={g}")
+    return c
