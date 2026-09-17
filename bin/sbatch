@@ -18,6 +18,11 @@ def main():
     parser.add_argument("--chdir", "-D", help="Override working directory")
     parser.add_argument("--output", "-o", help="Override stdout log path")
     parser.add_argument("--error", "-e", help="Override stderr log path")
+    parser.add_argument("--nodelist", "-w", help="Request a specific list of hosts/nodes")
+    parser.add_argument("--constraint", "-C", help="Specify node/hardware constraints")
+    parser.add_argument("--cpus-per-task", "-c", type=int, help="Override CPUs per task")
+    parser.add_argument("--mem", help="Override memory (e.g. 16G, 32000)")
+    parser.add_argument("--gres", help="Override generic resources (e.g. gpu:1)")
     args = parser.parse_args()
 
     default_chdir = os.getcwd()
@@ -40,6 +45,21 @@ def main():
             params["stdout"] = args.output
         if args.error:
             params["stderr"] = args.error
+        if args.nodelist:
+            params["nodelist"] = args.nodelist.strip()
+        if args.constraint:
+            params["gres_model"] = args.constraint.lower().strip()
+        if args.cpus_per_task:
+            params["cpus_per_task"] = args.cpus_per_task
+        if args.mem:
+            from mslurm_parser import parse_memory_mb
+            params["mem_mb"] = parse_memory_mb(args.mem)
+        if args.gres:
+            from mslurm_parser import parse_gres
+            g, m = parse_gres(args.gres)
+            params["gpus"] = g
+            if m:
+                params["gres_model"] = m.lower().strip()
 
         user = getpass.getuser()
         db_path = os.path.join(BASE_DIR, "var", "mslurm.db")
@@ -56,7 +76,8 @@ def main():
             chdir=params["chdir"],
             script_content=content,
             stdout_path=params["stdout"],
-            stderr_path=params["stderr"]
+            stderr_path=params["stderr"],
+            req_nodelist=params.get("nodelist")
         )
 
         if args.parsable:

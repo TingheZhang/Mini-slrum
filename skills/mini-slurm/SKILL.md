@@ -55,9 +55,10 @@ python train.py --epochs 10
 ### Supported Directives
 - `--job-name`, `-J`: Name of the job.
 - `--cpus-per-task`, `-c`: Number of CPU cores required (e.g. `-c 4` or `--cpus-per-task=4`).
-- `--mem`: Memory in MB required.
+- `--mem`: Memory required (e.g. `--mem=16G`, `--mem=32000`).
 - `--gres=gpu:<count>`: Number of GPUs required (e.g. `--gres=gpu:1` or `--gres=gpu:a100:2`).
-- `-C`, `--constraint`: Hardware model requirement (e.g. `-C a100`, `-C rtx6000`, `-C rtx2080ti`).
+- `-C`, `--constraint`: Hardware model/feature requirement (e.g. `-C a100`, `-C rtx6000`, `-C rtx2080ti`). Constrains both GPU and CPU-only jobs to nodes possessing that hardware.
+- `-w`, `--nodelist`: Specific node(s) to pin the job to (e.g. `-w 176`, `-w 174`, or `--nodelist=176,174`).
 - `--time`, `-t`: Time limit in `HH:MM:SS`, `MM:SS`, or `D-HH:MM:SS`.
 - `--output`, `-o`: Stdout redirection path (supports `%j` placeholder for job ID).
 - `--error`, `-e`: Stderr redirection path (supports `%j` placeholder for job ID).

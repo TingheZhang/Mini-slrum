@@ -59,7 +59,12 @@ def main():
         elif st == "STARTING":
             res = f"{j['allocated_node']} (Launching)"
         elif st == "PENDING":
-            res = "(Resources)"
+            if j.get("req_nodelist"):
+                res = f"({j['req_nodelist']})"
+            elif j.get("gres_model"):
+                res = f"({j['gres_model']})"
+            else:
+                res = "(Resources)"
         else:
             res = f"({st})"
 

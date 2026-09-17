@@ -130,6 +130,7 @@ def parse_sbatch_script(script_path_or_content, is_content=False, default_chdir=
         "gpus": 0,
         "gres_model": None,
         "constraint": None,
+        "nodelist": None,
         "time_sec": 0,
         "chdir": safe_chdir,
         "stdout": None,
@@ -157,7 +158,7 @@ def parse_sbatch_script(script_path_or_content, is_content=False, default_chdir=
         while i < len(tokens):
             tok = tokens[i]
             
-            # Helper to get value either from --key=val or next token
+            # Helper to get value either from --key=val, next token, or -kVal
             def get_val(tok, flag, next_i):
                 if tok.startswith(flag + "="):
                     return tok[len(flag) + 1:], next_i
@@ -165,6 +166,8 @@ def parse_sbatch_script(script_path_or_content, is_content=False, default_chdir=
                     if next_i >= len(tokens):
                         raise ValueError(f"Option {flag} requires an argument")
                     return tokens[next_i], next_i + 1
+                elif len(flag) == 2 and flag.startswith("-") and tok.startswith(flag) and len(tok) > 2 and not tok.startswith("--"):
+                    return tok[2:], next_i
                 return None, next_i
 
             # Check each supported option
@@ -259,7 +262,15 @@ def parse_sbatch_script(script_path_or_content, is_content=False, default_chdir=
             if val is None:
                 val, next_i = get_val(tok, "-C", i + 1)
             if val is not None:
-                params["constraint"] = val.lower()
+                params["constraint"] = val.lower().strip()
+                i = next_i
+                continue
+
+            val, next_i = get_val(tok, "--nodelist", i + 1)
+            if val is None:
+                val, next_i = get_val(tok, "-w", i + 1)
+            if val is not None:
+                params["nodelist"] = val.strip()
                 i = next_i
                 continue
 

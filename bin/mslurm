@@ -27,7 +27,9 @@ CAPABILITIES = {
         "#SBATCH --output=PATH (-o, supports %j)",
         "#SBATCH --error=PATH (-e, supports %j)",
         "#SBATCH --nodes=1 (-N)",
-        "#SBATCH --ntasks=1 (-n)"
+        "#SBATCH --ntasks=1 (-n)",
+        "#SBATCH --nodelist=NODES (-w)",
+        "#SBATCH --constraint=FEATURES (-C)"
     ],
     "supported_gpu_models": ["a100", "a800", "rtx6000", "rtx2080ti"],
     "cli_commands": ["sbatch", "squeue", "sinfo", "sacct", "scancel", "mslurm"],

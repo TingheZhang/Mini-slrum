@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     req_mem_mb INTEGER DEFAULT 8192 CHECK (req_mem_mb >= 1),
     req_gpus INTEGER DEFAULT 0 CHECK (req_gpus >= 0),
     gres_model TEXT,
+    req_nodelist TEXT,
     time_limit_sec INTEGER DEFAULT 0 CHECK (time_limit_sec >= 0),
     chdir TEXT,
     script_content TEXT,
@@ -164,10 +165,12 @@ class MiniSlurmDB:
             conn.execute(f"INSERT INTO jobs ({col_list}) SELECT {select_list} FROM _jobs_old;")
             conn.execute("DROP TABLE _jobs_old;")
 
-        # Ensure dispatch_time column exists
+        # Ensure dispatch_time and req_nodelist columns exist
         cols = [r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
         if "dispatch_time" not in cols:
             conn.execute("ALTER TABLE jobs ADD COLUMN dispatch_time REAL")
+        if "req_nodelist" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN req_nodelist TEXT")
 
         # 2. Ensure cpu_mem_allocations has CHECK constraints
         cma_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='cpu_mem_allocations'").fetchone()
@@ -248,7 +251,8 @@ class MiniSlurmDB:
                     conn.execute("UPDATE nodes SET status = 'DRAIN' WHERE name = ?", (db_n,))
 
     def submit_job(self, name, user, req_cpus, req_mem_mb, req_gpus, gres_model,
-                   time_limit_sec, chdir, script_content, stdout_path, stderr_path):
+                   time_limit_sec, chdir, script_content, stdout_path, stderr_path,
+                   req_nodelist=None):
         if req_cpus < 1:
             raise ValueError(f"req_cpus must be >= 1, got {req_cpus}")
         if req_mem_mb < 1:
@@ -264,12 +268,12 @@ class MiniSlurmDB:
             cur.execute("""
                 INSERT INTO jobs (
                     name, user, status, req_cpus, req_mem_mb, req_gpus, gres_model,
-                    time_limit_sec, chdir, script_content, stdout_path, stderr_path,
+                    req_nodelist, time_limit_sec, chdir, script_content, stdout_path, stderr_path,
                     submit_time
-                ) VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 name, user, req_cpus, req_mem_mb, req_gpus, gres_model,
-                time_limit_sec, chdir, script_content, stdout_path, stderr_path, now
+                req_nodelist, time_limit_sec, chdir, script_content, stdout_path, stderr_path, now
             ))
             job_id = cur.lastrowid
             return job_id
@@ -295,6 +299,7 @@ class MiniSlurmDB:
             req_mem_mb = job["req_mem_mb"]
             req_gpus = job["req_gpus"]
             gres_model = job["gres_model"]
+            req_nodelist = job["req_nodelist"] if "req_nodelist" in job.keys() else None
 
             # Only candidate nodes that are strictly UP
             nodes = cur.execute("SELECT * FROM nodes WHERE status = 'UP'").fetchall()
@@ -303,7 +308,31 @@ class MiniSlurmDB:
                 node_name = node["name"]
                 total_cpus = node["total_cpus"]
                 total_mem = node["total_mem_mb"]
-                
+
+                # 1. Nodelist filter: if specified, node_name must match one of the allowed nodes
+                if req_nodelist:
+                    allowed_nodes = [n.strip().lower() for n in req_nodelist.split(",") if n.strip()]
+                    if node_name.lower().strip() not in allowed_nodes:
+                        continue
+
+                # 2. Hardware / constraint filter: if gres_model / constraint specified,
+                # node must match either directly by node_name or have matching GPU model / alias
+                if gres_model:
+                    req_m = gres_model.lower().strip()
+                    node_matches_constraint = False
+                    if req_m == node_name.lower().strip():
+                        node_matches_constraint = True
+                    else:
+                        node_gpus = json.loads(node["gpu_info"]) if node["gpu_info"] else []
+                        for g in node_gpus:
+                            g_model = g.get("model", "").lower().strip()
+                            aliases = [a.lower().strip() for a in g.get("aliases", [])] + [g_model]
+                            if req_m in aliases:
+                                node_matches_constraint = True
+                                break
+                    if not node_matches_constraint:
+                        continue
+
                 # Check current allocated CPU/RAM
                 alloc = cur.execute("SELECT allocated_cpus, allocated_mem_mb FROM cpu_mem_allocations WHERE node_name = ?", (node_name,)).fetchone()
                 cur_cpus = alloc["allocated_cpus"] if alloc else 0
@@ -327,8 +356,8 @@ class MiniSlurmDB:
                             eligible_gpus.append(g["id"])
                         else:
                             req_m = gres_model.lower().strip()
-                            # Exact match against model or configured aliases
-                            matched = (req_m == g_model) or (req_m in aliases)
+                            # Exact match against model, configured aliases, or node_name
+                            matched = (req_m == g_model) or (req_m in aliases) or (req_m == node_name.lower().strip())
                             if matched:
                                 eligible_gpus.append(g["id"])
                     
