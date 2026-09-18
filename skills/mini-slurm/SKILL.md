@@ -71,9 +71,10 @@ When an AI agent is asked to train a model, run experiments, or execute benchmar
 1. **Check Resources First**:
    Always run `sinfo` to check which nodes and GPUs are currently idle (`0/4` or `0/8` allocated).
 2. **Select Constraints Appropriately**:
-   - If training requires high VRAM (>40GB), request `-C a100` or target `a800`.
+   - If training requires very high VRAM (>40GB), request `-C a100` or target `a800` (80GB SXM4) / `178` (40GB PCIe).
    - If running standard inference or fast testing, request `-C rtx6000` or `-C rtx2080ti`.
    - If running purely data preprocessing, omit `--gres` and only request `-c <cpus> --mem <mb>`.
+   - Use `-w <nodename>` to pin a job to a specific node (e.g. `-w 178`, `-w 176`).
 3. **Submit with `sbatch`**:
    Submit the script and capture the printed Job ID:
    ```bash

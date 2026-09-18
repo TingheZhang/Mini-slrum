@@ -4,7 +4,7 @@
 [![Python: 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-Standard%20Library%20Only-brightgreen.svg)]()
 [![Slurm Compatible](https://img.shields.io/badge/CLI-Slurm%20Compatible-orange.svg)]()
-[![Battle Tested](https://img.shields.io/badge/Tests-3%20Audit%20Rounds%20Passed-success.svg)]()
+[![Battle Tested](https://img.shields.io/badge/Tests-4%20Audit%20Rounds%20Passed-success.svg)]()
 
 **Mini-Slurm** 是一个专为中小规模多机 CPU / GPU 计算集群设计的轻量级、免 Root、免常驻节点守护进程的分布式作业调度系统。
 
@@ -24,7 +24,7 @@
   - `sacct`：作业历史耗时、退出码与状态溯源。
   - `mslurm`：一键管理调度服务（`start` / `stop` / `restart` / `status` / `logs`）。
 - **多用户物理防踩踏与透明硬件感知 (Hardware Awareness & Anti-Collision)**：专为共享计算集群设计！调度器通过多线程并发探测远端 `nvidia-smi` 物理显存；他人直接登录裸跑占用的卡自动标记为 `EXT_BUSY` 并主动避让；`sinfo` 支持概要显示 `GPUS(A/E/I/T)`（已分配/外部占用/完全空闲/总数），`sinfo -l` 详细透视每张卡的显存使用量与归属。
-- **极度严苛的安全与并发设计（历经三轮专家混沌审计）**：
+- **极度严苛的安全与并发设计（历经四轮专家混沌审计）**：
   - **时钟漂移免疫**：采用单调递增序列号（`heartbeat_seq`）与调度端本地单调时钟比对，彻底免疫节点间数小时级的墙钟偏差。
   - **网络异常资源冻结**：SSH 探测返回 255（网络不通/节点故障）时，调度器严格保持 GPU 预留，必须经正向探针证实无存活进程后才允许回收。
   - **Token 级进程探针**：基于 `/proc/*/cmdline` 的 NUL 字节严格分词匹配，杜绝自身匹配（Self-matching）与作业号前缀串扰（Prefix bleed，如取消 Job 1 误杀 Job 10/11）。
@@ -52,6 +52,7 @@ flowchart TD
     HeadNode -->|OpenSSH (按需无常驻 Agent)| WorkerA["计算节点 A (如 a800: A100-SXM4-80GB)"]
     HeadNode -->|OpenSSH (按需无常驻 Agent)| WorkerB["计算节点 B (如 172share: RTX 6000 Ada)"]
     HeadNode -->|OpenSSH (按需无常驻 Agent)| WorkerC["计算节点 C (如 176: RTX 2080Ti)"]
+    HeadNode -->|OpenSSH (按需无常驻 Agent)| WorkerD["计算节点 D (如 178: A100-PCIE-40GB)"]
 
     subgraph SharedStorage["共享存储 (如 /mnt/share)"]
         Exec["libexec/mslurm-executor"]
@@ -61,6 +62,7 @@ flowchart TD
     WorkerA <--> SharedStorage
     WorkerB <--> SharedStorage
     WorkerC <--> SharedStorage
+    WorkerD <--> SharedStorage
 ```
 
 ---
@@ -140,9 +142,12 @@ sinfo
 
 输出示例：
 ```text
-NODELIST     STATE    CPUS(A/I/T)    MEM(A/T MB)        GPUS(A/T)    GPU_MODELS          
-node-rtx     UP       0/16/16        0/64000            0/1          rtx6000             
-node-a100    UP       0/24/24        0/120000           0/2          a100                
+NODELIST     STATE    CPUS(A/I/T)    MEM(A/T MB)        GPUS(A/E/I/T)    GPU_MODELS
+172share     UP       0/24/24        0/120000           0/0/4/4          rtx6000
+174          UP       0/36/36        0/120000           0/0/0/0          none
+176          UP       0/24/24        0/120000           0/0/4/4          rtx2080ti
+178          UP       0/64/64        0/500000           0/0/8/8          a100-pcie-40gb
+a800         UP       0/24/24        0/120000           0/0/8/8          a100
 ```
 
 ---
@@ -226,7 +231,7 @@ Mini-Slurm 仓库自带 `skills/mini-slurm/SKILL.md`，专门为各种主流 AI 
 
 ## 🛡️ 混沌测试与安全性验证 (Auditing & Tests)
 
-Mini-Slurm 在设计过程中接受了三轮严格的对抗式自动化审计测试，内置了完备的测试套件（位于 `tests/` 目录）：
+Mini-Slurm 在设计过程中接受了四轮严格的对抗式自动化审计测试，内置了完备的测试套件（位于 `tests/` 目录）：
 
 ```bash
 # 运行第一轮基线 11 项用例测试（并发争抢、幂等结算、负资源拒绝、空格指令兼容等）
@@ -235,9 +240,15 @@ python3 -B tests/test_safety.py
 # 运行第二轮安全 10 项测试（SSH 255 网络断连保护、时钟漂移心跳、set -m 进程清理、CHECK 约束等）
 python3 -B tests/test_reaudit.py
 
-# 运行第三轮专项目测试（Token 级 /proc 探针防自匹配、前缀隔离、早期 SIGTERM 防孤儿、旧数据安全迁移）
+# 运行第三轮专项测试（Token 级 /proc 探针防自匹配、前缀隔离、早期 SIGTERM 防孤儿、旧数据安全迁移）
 python3 -B tests/test_probe_and_kill.py
 python3 -B tests/test_t3_t4.py
+
+# 运行物理 GPU 感知与防碰撞测试（外部占用检测、显存穿透探测、动态恢复）
+python3 -B tests/test_hardware_awareness.py
+
+# 运行第四轮 19 项深度隔离测试（-C/--gres 冲突仲裁、遥测 Fail-Closed、节点名校验、迁移兼容）
+python3 -B tests/test_nodelist_constraint.py
 ```
 
 ---
@@ -272,7 +283,9 @@ mini-slurm/
 │   ├── test_safety.py         # 第一轮 11 项安全性测试
 │   ├── test_reaudit.py        # 第二轮 10 项安全与边界测试
 │   ├── test_probe_and_kill.py # 进程参数数组精确匹配专项测试
-│   └── test_t3_t4.py          # 极速信号处理与脏数据热迁移测试
+│   ├── test_t3_t4.py          # 极速信号处理与脏数据热迁移测试
+│   ├── test_hardware_awareness.py  # 物理 GPU 感知与防碰撞测试
+│   └── test_nodelist_constraint.py # 约束冲突仲裁与节点校验测试
 ├── skills/                    # AI Agent 智能体技能库
 │   └── mini-slurm/
 │       └── SKILL.md           # Mini-Slurm Agent Skill 规范文件

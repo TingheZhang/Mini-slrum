@@ -33,6 +33,7 @@ var/*.log
 var/*.pid
 var/*.lock
 var/backups/
+etc/nodes.json
 jobs/
 
 # Environment

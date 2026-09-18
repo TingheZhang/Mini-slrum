@@ -55,6 +55,23 @@
         {"id": 3, "model": "rtx2080ti", "aliases": ["rtx2080ti", "2080ti"]}
       ],
       "enabled": true
+    },
+    "178": {
+      "ssh_target": "178",
+      "python_bin": "/usr/bin/python3",
+      "cpus": 64,
+      "mem_mb": 500000,
+      "gpus": [
+        {"id": 0, "model": "a100-pcie-40gb", "aliases": ["a100", "a100-pcie", "a100-pcie-40gb", "a100-40gb"]},
+        {"id": 1, "model": "a100-pcie-40gb", "aliases": ["a100", "a100-pcie", "a100-pcie-40gb", "a100-40gb"]},
+        {"id": 2, "model": "a100-pcie-40gb", "aliases": ["a100", "a100-pcie", "a100-pcie-40gb", "a100-40gb"]},
+        {"id": 3, "model": "a100-pcie-40gb", "aliases": ["a100", "a100-pcie", "a100-pcie-40gb", "a100-40gb"]},
+        {"id": 4, "model": "a100-pcie-40gb", "aliases": ["a100", "a100-pcie", "a100-pcie-40gb", "a100-40gb"]},
+        {"id": 5, "model": "a100-pcie-40gb", "aliases": ["a100", "a100-pcie", "a100-pcie-40gb", "a100-40gb"]},
+        {"id": 6, "model": "a100-pcie-40gb", "aliases": ["a100", "a100-pcie", "a100-pcie-40gb", "a100-40gb"]},
+        {"id": 7, "model": "a100-pcie-40gb", "aliases": ["a100", "a100-pcie", "a100-pcie-40gb", "a100-40gb"]}
+      ],
+      "enabled": true
     }
   }
 }
