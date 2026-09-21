@@ -61,20 +61,20 @@ flowchart TD
 
     subgraph MasterNode["Master Node (Head Node)"]
         Sched["mslurm-sched (Scheduler Daemon)"]
-        DB[(SQLite WAL<br/>Ledger & Queue)]
-        Lock["mslurm-sched.lock<br/>Exclusive flock"]
+        DB[("SQLite WAL Ledger & Queue")]
+        Lock["mslurm-sched.lock Exclusive Lock"]
         Sched <--> DB
         Sched --- Lock
     end
 
-    Sched -->|OpenSSH (On-demand, No Agent)| WorkerA["GPU Node A (e.g. 8x A100 80GB)"]
-    Sched -->|OpenSSH (On-demand, No Agent)| WorkerB["GPU Node B (e.g. 4x RTX 6000)"]
-    Sched -->|OpenSSH (On-demand, No Agent)| WorkerC["GPU Node C (e.g. 4x RTX 2080Ti)"]
-    Sched -->|OpenSSH (On-demand, No Agent)| WorkerD["CPU Node D (General Compute)"]
+    Sched -->|OpenSSH on-demand| WorkerA["GPU Node A (8x A100 80GB)"]
+    Sched -->|OpenSSH on-demand| WorkerB["GPU Node B (4x RTX 6000)"]
+    Sched -->|OpenSSH on-demand| WorkerC["GPU Node C (4x RTX 2080Ti)"]
+    Sched -->|OpenSSH on-demand| WorkerD["CPU Node D (General Compute)"]
 
     subgraph SharedStorage["Shared Cluster Storage (NFS / Ceph / SMB)"]
         Exec["libexec/mslurm-executor"]
-        JobsDir["jobs/{job_id}/<br/>├── job.sh<br/>├── slurm.out / slurm.err<br/>├── .status.json<br/>└── .cancel"]
+        JobsDir["jobs/job_id/<br/>job.sh / slurm.out / .status.json"]
     end
 
     WorkerA <--> SharedStorage

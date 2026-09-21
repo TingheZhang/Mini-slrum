@@ -61,20 +61,20 @@ flowchart TD
 
     subgraph MasterNode["主控调度节点 (Head Node)"]
         Sched["mslurm-sched (调度守护进程)"]
-        DB[(SQLite WAL<br/>资源账本与作业队列)]
-        Lock["mslurm-sched.lock<br/>flock 独占单实例锁"]
+        DB[("SQLite WAL 资源账本与作业队列")]
+        Lock["mslurm-sched.lock 独占单实例锁"]
         Sched <--> DB
         Sched --- Lock
     end
 
-    Sched -->|OpenSSH (按需无常驻 Agent)| WorkerA["GPU 节点 A (如 8x A100 80GB)"]
-    Sched -->|OpenSSH (按需无常驻 Agent)| WorkerB["GPU 节点 B (如 4x RTX 6000)"]
-    Sched -->|OpenSSH (按需无常驻 Agent)| WorkerC["GPU 节点 C (如 4x RTX 2080Ti)"]
-    Sched -->|OpenSSH (按需无常驻 Agent)| WorkerD["CPU 节点 D (通用计算算力)"]
+    Sched -->|OpenSSH 按需执行| WorkerA["GPU 节点 A (8x A100 80GB)"]
+    Sched -->|OpenSSH 按需执行| WorkerB["GPU 节点 B (4x RTX 6000)"]
+    Sched -->|OpenSSH 按需执行| WorkerC["GPU 节点 C (4x RTX 2080Ti)"]
+    Sched -->|OpenSSH 按需执行| WorkerD["CPU 节点 D (通用计算算力)"]
 
     subgraph SharedStorage["共享存储集群 (NFS / Ceph / SMB)"]
         Exec["libexec/mslurm-executor"]
-        JobsDir["jobs/{job_id}/<br/>├── job.sh<br/>├── slurm.out / slurm.err<br/>├── .status.json<br/>└── .cancel"]
+        JobsDir["jobs/job_id/<br/>job.sh / slurm.out / .status.json"]
     end
 
     WorkerA <--> SharedStorage
